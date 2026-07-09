@@ -294,20 +294,6 @@ def available_slots(df: pd.DataFrame, d: date) -> list[str]:
     return [s for s in SLOTS if counts.get(s, 0) < SLOT_CAPACITY]
 
 
-def next_available_summary(df: pd.DataFrame, days: int = 10) -> str:
-    """Compact availability text for the AI assistant's context."""
-    lines, d, found = [], date.today() + timedelta(days=MIN_LEAD_DAYS), 0
-    while found < days and d <= date.today() + timedelta(days=BOOKING_WINDOW_DAYS):
-        ok, _ = is_business_day(d)
-        if ok:
-            free = available_slots(df, d)
-            lines.append(f"{d.strftime('%a %d %b %Y')}: "
-                         + (", ".join(s.split(" - ")[0] for s in free) if free else "FULL"))
-            found += 1
-        d += timedelta(days=1)
-    return "\n".join(lines)
-
-
 def make_ics(row: dict) -> bytes:
     start_h = int(row["time_slot"].split(":")[0])
     d = row["date"].replace("-", "")
@@ -372,71 +358,253 @@ def get_claude():
         return None
 
 
-ASSISTANT_SYSTEM = """You are the Hexagon Service Assistant, helping customers book
-service appointments at the Hexagon service centre in India.
+_BOOKING_FIELDS = {
+    "name": {"type": "string", "description": "Customer full name"},
+    "mobile": {"type": "string", "description": "10-digit Indian mobile number"},
+    "company": {"type": "string", "description": "Company name, empty string if not given"},
+    "email": {"type": "string", "description": "Email for confirmation mail, empty if not given"},
+    "state": {"type": "string", "description": "Indian state"},
+    "city": {"type": "string", "description": "City"},
+    "serial_number": {"type": "string", "description": "Machine serial number"},
+    "service_type": {"type": "string", "enum": SERVICE_TYPES},
+    "date": {"type": "string", "description": "ISO date YYYY-MM-DD"},
+    "time_slot": {"type": "string", "enum": SLOTS},
+}
 
-FACTS (never contradict these):
-- Working days: Monday to Friday only. Closed weekends and Indian public holidays.
-- Slots: hourly, 09:00 to 17:00 (last slot 16:00 - 17:00).
-- Bookings open from tomorrow up to {window} days ahead.
-- Required details: full name, 10-digit Indian mobile number, state, city,
-  machine serial number, type of service, preferred date, preferred time slot.
-- Optional: company name, email.
+AGENT_TOOLS = [
+    {
+        "name": "check_availability",
+        "description": ("Check which time slots are free on a given date. ALWAYS call "
+                        "this before offering, agreeing to, or proposing any slot."),
+        "input_schema": {
+            "type": "object",
+            "properties": {"date": {"type": "string", "description": "ISO date YYYY-MM-DD"}},
+            "required": ["date"],
+        },
+    },
+    {
+        "name": "find_bookings",
+        "description": ("Look up confirmed bookings by Appointment ID (e.g. HEX-1A2B3C) "
+                        "or 10-digit mobile number. Call this before any reschedule or "
+                        "cancellation."),
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "propose_booking",
+        "description": ("Propose a NEW booking. Shows the user a Confirm button - the "
+                        "system books only after they press it. Call only when every "
+                        "required field is collected AND check_availability showed the "
+                        "slot free."),
+        "input_schema": {
+            "type": "object",
+            "properties": _BOOKING_FIELDS,
+            "required": ["name", "mobile", "state", "city", "serial_number",
+                          "service_type", "date", "time_slot"],
+        },
+    },
+    {
+        "name": "propose_reschedule",
+        "description": ("Propose moving an existing booking to a new date/slot. Shows a "
+                        "Confirm button. Call find_bookings and check_availability first."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "appointment_id": {"type": "string"},
+                "new_date": {"type": "string", "description": "ISO date YYYY-MM-DD"},
+                "new_time_slot": {"type": "string", "enum": SLOTS},
+            },
+            "required": ["appointment_id", "new_date", "new_time_slot"],
+        },
+    },
+    {
+        "name": "propose_cancellation",
+        "description": ("Propose cancelling an existing booking. Shows a Confirm button. "
+                        "Call find_bookings first to identify the booking."),
+        "input_schema": {
+            "type": "object",
+            "properties": {"appointment_id": {"type": "string"}},
+            "required": ["appointment_id"],
+        },
+    },
+]
+
+AGENT_SYSTEM = """You are the Hexagon Service Agent. You operate the Hexagon service
+centre appointment system on the customer's behalf, using your tools.
+
+TODAY is {today} ({weekday}).
+
+FACTS:
+- Service centre: Monday-Friday only, hourly slots 09:00-17:00. Closed weekends
+  and Indian public holidays.
+- Bookings open from tomorrow up to {window} days ahead. Up to {capacity}
+  bookings per slot.
 - Service types: {services}.
-- CURRENT AVAILABILITY (next business days, free slot start times):
-{availability}
+- Required for a booking: full name, 10-digit Indian mobile, state, city,
+  machine serial number, service type, date, time slot. Optional: company,
+  email (an email gets a confirmation mail).
 
 RULES:
-- Be warm, brief and professional. Indian business register. No emojis.
-- Ask for at most two missing details per message.
-- NEVER invent availability - only offer slots listed above. If the user asks
-  about a date not listed, say you'll check it when they confirm, and prefer
-  suggesting listed dates.
-- Users can also reschedule/cancel in the "Manage booking" tab with their
-  Appointment ID or mobile number - direct them there for changes.
-- When you have ALL required details AND the chosen slot appears free above,
-  end your message with EXACTLY this block (no other text after it):
-
-```json
-{{"action": "propose_booking", "name": "...", "mobile": "...", "company": "",
-"email": "", "state": "...", "city": "...", "serial_number": "...",
-"service_type": "...", "date": "YYYY-MM-DD", "time_slot": "HH:00 - HH:00"}}
-```
-
-The app will show the user a confirm button - the booking is only made after
-they press it, so do not claim the booking is confirmed yourself."""
+- NEVER invent availability. Always call check_availability before mentioning
+  or choosing a slot. Only offer slots the tool returned.
+- For reschedule or cancellation, always call find_bookings first.
+- The propose_* tools only SHOW the user a Confirm button. Never say a booking
+  is confirmed, moved, or cancelled - say it is ready and ask them to press
+  Confirm. A [SYSTEM NOTE] in the user's message reports what actually
+  happened after they pressed it - trust that note.
+- Resolve relative dates ("tomorrow", "next Tuesday") from TODAY and say the
+  resolved date back to the user.
+- Ask for at most two missing details per message. Warm, brief, professional
+  Indian business register. No emojis.
+- Only help with service centre matters."""
 
 
-def ask_assistant(client, history: list[dict], availability: str) -> str:
-    system = ASSISTANT_SYSTEM.format(
-        window=BOOKING_WINDOW_DAYS,
+def _agent_system() -> str:
+    today = date.today()
+    return AGENT_SYSTEM.format(
+        today=today.isoformat(), weekday=today.strftime("%A"),
+        window=BOOKING_WINDOW_DAYS, capacity=SLOT_CAPACITY,
         services=", ".join(SERVICE_TYPES),
-        availability=availability,
     )
-    for attempt in range(2):
+
+
+def _find_confirmed(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    q = query.strip().upper()
+    qm = re.sub(r"\D", "", query)
+    mask = df["appointment_id"].str.upper() == q
+    if len(qm) == 10:
+        mask = mask | (df["mobile"] == qm)
+    return df[(df["status"] == "Confirmed") & mask]
+
+
+def execute_tool(name: str, args: dict) -> dict:
+    """Run one agent tool. Reads execute immediately; writes only create a
+    pending proposal that the user must confirm in the UI."""
+    df = load_appointments()
+
+    if name == "check_availability":
+        try:
+            d = date.fromisoformat(str(args.get("date", "")))
+        except ValueError:
+            return {"error": "Invalid date - use YYYY-MM-DD."}
+        if d < date.today() + timedelta(days=MIN_LEAD_DAYS):
+            return {"date": d.isoformat(), "available": False,
+                    "reason": "Bookings start from tomorrow onwards."}
+        if d > date.today() + timedelta(days=BOOKING_WINDOW_DAYS):
+            return {"date": d.isoformat(), "available": False,
+                    "reason": f"Bookings are open only {BOOKING_WINDOW_DAYS} days ahead."}
+        ok, why = is_business_day(d)
+        if not ok:
+            return {"date": d.isoformat(), "available": False, "reason": why}
+        free = available_slots(df, d)
+        return {"date": d.isoformat(), "available": bool(free), "free_slots": free,
+                **({} if free else {"reason": "All slots are booked that day."})}
+
+    if name == "find_bookings":
+        found = _find_confirmed(df, str(args.get("query", "")))
+        return {"bookings": [
+            {"appointment_id": r.appointment_id, "date": r.date,
+             "time_slot": r.time_slot, "service_type": r.service_type,
+             "name": r.name, "serial_number": r.serial_number}
+            for r in found.head(5).itertuples()
+        ]}
+
+    if name == "propose_booking":
+        problems = validate_booking(df, args)
+        if problems:
+            return {"accepted": False, "problems": problems}
+        st.session_state.agent_pending = {"kind": "create", "data": dict(args)}
+        return {"accepted": True,
+                "status": "Proposal shown to the user with a Confirm button. "
+                          "Ask them to review it and press Confirm."}
+
+    if name == "propose_reschedule":
+        apt = str(args.get("appointment_id", "")).strip().upper()
+        row = _find_confirmed(df, apt)
+        if row.empty:
+            return {"accepted": False, "problems": ["No confirmed booking with that Appointment ID."]}
+        current = row.iloc[0].to_dict()
+        try:
+            nd = date.fromisoformat(str(args.get("new_date", "")))
+        except ValueError:
+            return {"accepted": False, "problems": ["Invalid new date - use YYYY-MM-DD."]}
+        ok, why = is_business_day(nd)
+        if not ok:
+            return {"accepted": False, "problems": [why]}
+        if not (date.today() + timedelta(days=MIN_LEAD_DAYS) <= nd
+                <= date.today() + timedelta(days=BOOKING_WINDOW_DAYS)):
+            return {"accepted": False, "problems": ["New date is outside the booking window."]}
+        ns = args.get("new_time_slot", "")
+        free = available_slots(df, nd)
+        same = (nd.isoformat() == current["date"] and ns == current["time_slot"])
+        if ns not in SLOTS or (ns not in free and not same):
+            return {"accepted": False,
+                    "problems": ["That slot is not available.", f"Free that day: {free}"]}
+        st.session_state.agent_pending = {
+            "kind": "reschedule", "current": current,
+            "data": {"appointment_id": current["appointment_id"],
+                     "new_date": nd.isoformat(), "new_time_slot": ns}}
+        return {"accepted": True,
+                "status": "Reschedule proposal shown - ask the user to press Confirm."}
+
+    if name == "propose_cancellation":
+        apt = str(args.get("appointment_id", "")).strip().upper()
+        row = _find_confirmed(df, apt)
+        if row.empty:
+            return {"accepted": False, "problems": ["No confirmed booking with that Appointment ID."]}
+        st.session_state.agent_pending = {"kind": "cancel", "current": row.iloc[0].to_dict(),
+                                          "data": {"appointment_id": apt}}
+        return {"accepted": True,
+                "status": "Cancellation proposal shown - ask the user to press Confirm."}
+
+    return {"error": f"Unknown tool: {name}"}
+
+
+def run_agent(client, api_history: list, display_log: list, max_iters: int = 8):
+    """Agentic loop: call Claude, execute requested tools, feed results back,
+    repeat until it answers in plain text."""
+    retried_empty = False
+    for _ in range(max_iters):
         resp = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2000 * (attempt + 1),
-            system=system,
-            messages=history,
+            model=CLAUDE_MODEL, max_tokens=3000,
+            system=_agent_system(), tools=AGENT_TOOLS, messages=api_history,
         )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        if text:
-            return text
-        time.sleep(1)
-    return ("Sorry, I had trouble responding just now. You can also book "
-            "directly in the 'Book appointment' tab.")
-
-
-def extract_proposal(text: str) -> dict | None:
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
-    if not m:
-        return None
-    try:
-        data = json.loads(m.group(1))
-        return data if data.get("action") == "propose_booking" else None
-    except json.JSONDecodeError:
-        return None
+        blocks = []
+        for b in resp.content:
+            if b.type == "text" and b.text.strip():
+                blocks.append({"type": "text", "text": b.text})
+                display_log.append({"role": "assistant", "kind": "text", "text": b.text})
+            elif b.type == "tool_use":
+                blocks.append({"type": "tool_use", "id": b.id, "name": b.name,
+                               "input": b.input})
+                display_log.append({"role": "assistant", "kind": "tool",
+                                    "text": f"{b.name} → {json.dumps(b.input, default=str)[:140]}"})
+        if not blocks:  # adaptive-thinking starvation guard (Agent 9 lesson)
+            if retried_empty:
+                display_log.append({"role": "assistant", "kind": "text",
+                                    "text": "Sorry, I had trouble responding - please try again, "
+                                            "or use the Book appointment tab."})
+                return
+            retried_empty = True
+            time.sleep(1)
+            continue
+        api_history.append({"role": "assistant", "content": blocks})
+        tool_calls = [b for b in blocks if b["type"] == "tool_use"]
+        if resp.stop_reason == "tool_use" and tool_calls:
+            results = []
+            for tc in tool_calls:
+                out = execute_tool(tc["name"], tc["input"])
+                results.append({"type": "tool_result", "tool_use_id": tc["id"],
+                                "content": json.dumps(out, default=str)})
+            api_history.append({"role": "user", "content": results})
+            continue
+        return
+    display_log.append({"role": "assistant", "kind": "text",
+                        "text": "I've reached my step limit for this request - "
+                                "please rephrase or use the form tabs."})
 
 
 def validate_booking(df: pd.DataFrame, b: dict) -> list[str]:
@@ -668,62 +836,110 @@ with tab_manage:
 # ---------------------------------------------------------------------------
 
 with tab_ai:
-    st.subheader("Chat with the Service Assistant")
-    st.caption("Describe what you need in plain language - the assistant collects "
-               "your details and prepares the booking. Nothing is booked until "
-               "you press Confirm.")
+    st.subheader("Hexagon Service Agent")
+    st.caption("The agent can check availability, book, reschedule and cancel - "
+               "all through conversation. It operates the same booking engine as "
+               "the forms, and every change still needs your Confirm.")
     client = get_claude()
     if client is None:
-        st.info("The AI assistant needs ANTHROPIC_API_KEY in Streamlit Secrets. "
-                "Booking via the form tab works without it.")
+        st.info("The AI agent needs ANTHROPIC_API_KEY in Streamlit Secrets. "
+                "Booking via the form tabs works without it.")
     else:
-        if "chat" not in st.session_state:
-            st.session_state.chat = []
-        if "pending" not in st.session_state:
-            st.session_state.pending = None
+        st.session_state.setdefault("agent_api", [])
+        st.session_state.setdefault("agent_log", [])
+        st.session_state.setdefault("agent_pending", None)
+        st.session_state.setdefault("agent_note", "")
 
-        for m in st.session_state.chat:
-            with st.chat_message(m["role"]):
-                # hide the machine-readable block from the user
-                st.markdown(re.sub(r"```json.*?```", "", m["content"], flags=re.S).strip()
-                            or "_(prepared your booking below)_")
-
-        if st.session_state.pending:
-            b = st.session_state.pending
-            st.info(
-                f"**Ready to book:** {b.get('service_type')} · {b.get('date')} · "
-                f"{b.get('time_slot')}  \n{b.get('name')} · {b.get('mobile')} · "
-                f"{b.get('city')}, {b.get('state')} · S/N {b.get('serial_number')}"
-            )
-            cc1, cc2 = st.columns(2)
-            if cc1.button("Confirm this booking", use_container_width=True):
-                problems = validate_booking(df_all, b)
-                if problems:
-                    st.session_state.chat.append(
-                        {"role": "assistant",
-                         "content": "I couldn't complete that: " + " ".join(problems)})
+        for entry in st.session_state.agent_log:
+            with st.chat_message(entry["role"]):
+                if entry.get("kind") == "tool":
+                    st.caption(f"🔧 {entry['text']}")
                 else:
-                    row = do_book(df_all, b)
-                    email_status = try_send_email(row, "confirmed")
-                    st.session_state.chat.append(
-                        {"role": "assistant",
-                         "content": f"Booked! Your Appointment ID is **{row['appointment_id']}** "
-                                    f"for {row['date']} · {row['time_slot']}. {email_status}"})
-                st.session_state.pending = None
+                    st.markdown(entry["text"])
+
+        pending = st.session_state.agent_pending
+        if pending:
+            kind, data = pending["kind"], pending["data"]
+            if kind == "create":
+                st.info(f"**Ready to book:** {data.get('service_type')} · "
+                        f"{data.get('date')} · {data.get('time_slot')}  \n"
+                        f"{data.get('name')} · {data.get('mobile')} · "
+                        f"{data.get('city')}, {data.get('state')} · "
+                        f"S/N {data.get('serial_number')}")
+            elif kind == "reschedule":
+                cur = pending["current"]
+                st.info(f"**Reschedule {data['appointment_id']}:** "
+                        f"{cur['date']} · {cur['time_slot']} → "
+                        f"**{data['new_date']} · {data['new_time_slot']}**")
+            else:
+                cur = pending["current"]
+                st.info(f"**Cancel {data['appointment_id']}** "
+                        f"({cur['service_type']} · {cur['date']} · {cur['time_slot']})?")
+
+            cc1, cc2 = st.columns(2)
+            if cc1.button("Confirm", use_container_width=True, key="agent_confirm"):
+                fresh = load_appointments()
+                if kind == "create":
+                    problems = validate_booking(fresh, data)
+                    if problems:
+                        note = "Could not book: " + " ".join(problems)
+                    else:
+                        row = do_book(fresh, data)
+                        note = (f"Booked! Appointment ID **{row['appointment_id']}** - "
+                                f"{row['date']} · {row['time_slot']}. "
+                                + try_send_email(row, "confirmed"))
+                elif kind == "reschedule":
+                    ok = update_booking(data["appointment_id"],
+                                        {"date": data["new_date"],
+                                         "time_slot": data["new_time_slot"]})
+                    if ok:
+                        updated = {**pending["current"], "date": data["new_date"],
+                                   "time_slot": data["new_time_slot"]}
+                        note = (f"Rescheduled **{data['appointment_id']}** to "
+                                f"{data['new_date']} · {data['new_time_slot']}. "
+                                + try_send_email(updated, "rescheduled"))
+                    else:
+                        note = "Could not update the booking - please try again."
+                else:
+                    ok = update_booking(data["appointment_id"], {"status": "Cancelled"})
+                    note = (f"Cancelled **{data['appointment_id']}**. The slot is free again. "
+                            + try_send_email(pending["current"], "cancelled")
+                            ) if ok else "Could not cancel - please try again."
+                st.session_state.agent_log.append(
+                    {"role": "assistant", "kind": "text", "text": note})
+                st.session_state.agent_note = re.sub(r"\*", "", note)
+                st.session_state.agent_pending = None
                 st.rerun()
-            if cc2.button("Discard", use_container_width=True):
-                st.session_state.pending = None
+            if cc2.button("Discard", use_container_width=True, key="agent_discard"):
+                st.session_state.agent_note = "The user discarded the proposal without confirming."
+                st.session_state.agent_pending = None
                 st.rerun()
 
-        if prompt := st.chat_input("e.g. I need a calibration for my RTC360 next week"):
-            st.session_state.chat.append({"role": "user", "content": prompt})
-            with st.spinner("Thinking…"):
-                availability = next_available_summary(df_all)
-                reply = ask_assistant(client, st.session_state.chat, availability)
-            st.session_state.chat.append({"role": "assistant", "content": reply})
-            proposal = extract_proposal(reply)
-            if proposal:
-                st.session_state.pending = proposal
+        col_reset, _ = st.columns([1, 4])
+        if st.session_state.agent_log and col_reset.button("Start over"):
+            for k in ("agent_api", "agent_log", "agent_pending", "agent_note"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+        if prompt := st.chat_input(
+                "e.g. Book a calibration for my RTC360 next Tuesday, or "
+                "move HEX-1A2B3C to Friday"):
+            content = prompt
+            if st.session_state.agent_note:
+                content = f"[SYSTEM NOTE: {st.session_state.agent_note}]\n\n{prompt}"
+                st.session_state.agent_note = ""
+            st.session_state.agent_api.append({"role": "user", "content": content})
+            st.session_state.agent_log.append(
+                {"role": "user", "kind": "text", "text": prompt})
+            with st.spinner("Working…"):
+                try:
+                    run_agent(client, st.session_state.agent_api,
+                              st.session_state.agent_log)
+                except Exception as e:  # noqa: BLE001
+                    st.session_state.agent_log.append(
+                        {"role": "assistant", "kind": "text",
+                         "text": f"Something went wrong ({type(e).__name__}). "
+                                 "Please try again or use the form tabs."})
             st.rerun()
 
 # ---------------------------------------------------------------------------
