@@ -12,6 +12,7 @@ Slots:     Mon-Fri, 09:00-17:00, hourly. Indian public holidays blocked.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import smtplib
@@ -19,6 +20,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 from email.mime.text import MIMEText
+from pathlib import Path
 
 import gspread
 import holidays
@@ -666,9 +668,44 @@ def confirmation_panel(row: dict, email_status: str):
 # Header
 # ---------------------------------------------------------------------------
 
-st.markdown('<div class="hex-title">⬡ Hexagon Service Assistant</div>', unsafe_allow_html=True)
-st.markdown('<p class="hex-sub">Welcome to the Hexagon Service Centre - book, reschedule '
-            'or cancel your service appointment.</p>', unsafe_allow_html=True)
+def _logo_html() -> str:
+    """Embed logo.png from the repo root; fall back to the ⬡ mark."""
+    p = Path(__file__).parent / "logo.png"
+    if p.exists():
+        b64 = base64.b64encode(p.read_bytes()).decode()
+        return (f'<img src="data:image/png;base64,{b64}" '
+                'style="height:52px;width:auto;" alt="Hexagon"/>')
+    return '<span class="hex-title">⬡</span>'
+
+
+@st.dialog("Admin access")
+def admin_login_dialog():
+    pw = st.text_input("Admin password", type="password")
+    if st.button("Unlock", use_container_width=True):
+        if pw and pw == st.secrets.get("ADMIN_PASSWORD", ""):
+            st.session_state.admin_ok = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+
+head_l, head_r = st.columns([6, 1])
+with head_l:
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:14px;">{_logo_html()}'
+        '<span class="hex-title">Hexagon Service Assistant</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<p class="hex-sub">Welcome to the Hexagon Service Centre - book, reschedule '
+                'or cancel your service appointment.</p>', unsafe_allow_html=True)
+with head_r:
+    st.write("")
+    if st.session_state.get("admin_ok"):
+        if st.button("Exit admin", use_container_width=True):
+            st.session_state.admin_ok = False
+            st.rerun()
+    elif st.button("Admin", use_container_width=True):
+        admin_login_dialog()
 
 # Fail fast with a friendly message if storage isn't configured
 try:
@@ -678,8 +715,64 @@ except Exception as e:  # noqa: BLE001
              f"settings in Streamlit Secrets. ({type(e).__name__})")
     st.stop()
 
-tab_book, tab_manage, tab_ai, tab_admin = st.tabs(
-    ["Book appointment", "Manage booking", "AI assistant", "Admin"]
+# Admin mode replaces the customer view entirely
+if st.session_state.get("admin_ok"):
+    st.subheader("Admin - appointments overview")
+    data = df_all.copy()
+    if data.empty:
+        st.info("No appointments yet.")
+    else:
+        data["date_dt"] = pd.to_datetime(data["date"], errors="coerce")
+        show_cancelled = st.toggle("Include cancelled", value=False)
+        if not show_cancelled:
+            data = data[data["status"] == "Confirmed"]
+
+        view = st.radio("View", ["Day", "Week", "Month"], horizontal=True)
+        if view == "Day":
+            d = st.date_input("Day", value=date.today(), format="DD/MM/YYYY",
+                              key="adm_day")
+            sel = data[data["date_dt"].dt.date == d].sort_values("time_slot")
+            st.metric("Appointments", len(sel))
+        elif view == "Week":
+            anchor = st.date_input("Any date in the week", value=date.today(),
+                                   format="DD/MM/YYYY", key="adm_week")
+            monday = anchor - timedelta(days=anchor.weekday())
+            friday = monday + timedelta(days=4)
+            st.caption(f"Week: {monday.strftime('%d %b')} - {friday.strftime('%d %b %Y')}")
+            sel = data[(data["date_dt"].dt.date >= monday)
+                       & (data["date_dt"].dt.date <= friday)]
+            st.metric("Appointments this week", len(sel))
+            if not sel.empty:
+                per_day = sel.groupby(sel["date_dt"].dt.strftime("%a %d %b")).size()
+                st.bar_chart(per_day)
+            sel = sel.sort_values(["date", "time_slot"])
+        else:  # Month
+            months = pd.date_range(date.today().replace(day=1) - pd.DateOffset(months=2),
+                                   periods=6, freq="MS")
+            label = st.selectbox("Month", [m.strftime("%B %Y") for m in months],
+                                 index=2)
+            m_start = datetime.strptime(label, "%B %Y")
+            sel = data[(data["date_dt"].dt.year == m_start.year)
+                       & (data["date_dt"].dt.month == m_start.month)]
+            st.metric("Appointments this month", len(sel))
+            if not sel.empty:
+                per_day = sel.groupby(sel["date_dt"].dt.day).size()
+                st.bar_chart(per_day)
+            sel = sel.sort_values(["date", "time_slot"])
+
+        st.dataframe(
+            sel[["appointment_id", "status", "date", "time_slot", "name",
+                 "mobile", "company", "city", "state", "serial_number",
+                 "service_type"]],
+            use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download this view (CSV)",
+            data=sel.drop(columns=["date_dt"]).to_csv(index=False).encode(),
+            file_name="hexagon_appointments.csv", mime="text/csv")
+    st.stop()
+
+tab_ai, tab_book, tab_manage = st.tabs(
+    ["AI Agent", "Book appointment", "Manage booking"]
 )
 
 # ---------------------------------------------------------------------------
@@ -941,67 +1034,3 @@ with tab_ai:
                          "text": f"Something went wrong ({type(e).__name__}). "
                                  "Please try again or use the form tabs."})
             st.rerun()
-
-# ---------------------------------------------------------------------------
-# 4) Admin - day / week / month views
-# ---------------------------------------------------------------------------
-
-with tab_admin:
-    st.subheader("Admin - appointments overview")
-    pw = st.text_input("Admin password", type="password")
-    if not pw:
-        st.caption("Enter the admin password to view appointments.")
-    elif pw != st.secrets.get("ADMIN_PASSWORD", ""):
-        st.error("Incorrect password.")
-    else:
-        data = df_all.copy()
-        if data.empty:
-            st.info("No appointments yet.")
-        else:
-            data["date_dt"] = pd.to_datetime(data["date"], errors="coerce")
-            show_cancelled = st.toggle("Include cancelled", value=False)
-            if not show_cancelled:
-                data = data[data["status"] == "Confirmed"]
-
-            view = st.radio("View", ["Day", "Week", "Month"], horizontal=True)
-            if view == "Day":
-                d = st.date_input("Day", value=date.today(), format="DD/MM/YYYY",
-                                  key="adm_day")
-                sel = data[data["date_dt"].dt.date == d].sort_values("time_slot")
-                st.metric("Appointments", len(sel))
-            elif view == "Week":
-                anchor = st.date_input("Any date in the week", value=date.today(),
-                                       format="DD/MM/YYYY", key="adm_week")
-                monday = anchor - timedelta(days=anchor.weekday())
-                friday = monday + timedelta(days=4)
-                st.caption(f"Week: {monday.strftime('%d %b')} - {friday.strftime('%d %b %Y')}")
-                sel = data[(data["date_dt"].dt.date >= monday)
-                           & (data["date_dt"].dt.date <= friday)]
-                st.metric("Appointments this week", len(sel))
-                if not sel.empty:
-                    per_day = sel.groupby(sel["date_dt"].dt.strftime("%a %d %b")).size()
-                    st.bar_chart(per_day)
-                sel = sel.sort_values(["date", "time_slot"])
-            else:  # Month
-                months = pd.date_range(date.today().replace(day=1) - pd.DateOffset(months=2),
-                                       periods=6, freq="MS")
-                label = st.selectbox("Month", [m.strftime("%B %Y") for m in months],
-                                     index=2)
-                m_start = datetime.strptime(label, "%B %Y")
-                sel = data[(data["date_dt"].dt.year == m_start.year)
-                           & (data["date_dt"].dt.month == m_start.month)]
-                st.metric("Appointments this month", len(sel))
-                if not sel.empty:
-                    per_day = sel.groupby(sel["date_dt"].dt.day).size()
-                    st.bar_chart(per_day)
-                sel = sel.sort_values(["date", "time_slot"])
-
-            st.dataframe(
-                sel[["appointment_id", "status", "date", "time_slot", "name",
-                     "mobile", "company", "city", "state", "serial_number",
-                     "service_type"]],
-                use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download this view (CSV)",
-                data=sel.drop(columns=["date_dt"]).to_csv(index=False).encode(),
-                file_name="hexagon_appointments.csv", mime="text/csv")
