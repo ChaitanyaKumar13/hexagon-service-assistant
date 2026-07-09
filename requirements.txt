@@ -1,0 +1,6 @@
+streamlit
+anthropic
+gspread
+google-auth
+holidays
+pandas
