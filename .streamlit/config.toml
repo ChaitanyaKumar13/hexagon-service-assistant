@@ -1,0 +1,10 @@
+# Place at .streamlit/config.toml in the repo root.
+# Pins the Hexagon navy dark theme for every viewer (prevents the
+# white-on-white input bug on Windows light-mode machines).
+[theme]
+base = "dark"
+primaryColor = "#C9DD28"
+backgroundColor = "#0C2C40"
+secondaryBackgroundColor = "#123B54"
+textColor = "#D7E3EC"
+font = "sans serif"
