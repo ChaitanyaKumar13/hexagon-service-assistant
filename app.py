@@ -275,6 +275,13 @@ def valid_mobile(m: str) -> bool:
     return len(m) == 10 and m[0] in "6789"
 
 
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def valid_email(e: str) -> bool:
+    return bool(EMAIL_RE.match(e.strip()))
+
+
 def is_business_day(d: date) -> tuple[bool, str]:
     """Returns (ok, reason_if_not)."""
     if d.weekday() >= 5:
@@ -314,9 +321,12 @@ def make_ics(row: dict) -> bytes:
 def try_send_email(row: dict, kind: str = "confirmed") -> str:
     """Send a notification email if the visitor gave an address and SMTP is
     configured in secrets. Returns a short status string for the UI."""
-    if not row.get("email"):
+    to_addr = str(row.get("email", "")).strip()
+    if not to_addr:
         return "No email provided - showing on-screen confirmation only."
-    sender = st.secrets.get("EMAIL_SENDER", "")
+    if not valid_email(to_addr):
+        return f"The email address '{to_addr}' looks invalid, so no mail was sent."
+    sender = str(st.secrets.get("EMAIL_SENDER", "")).strip()
     app_pw = st.secrets.get("EMAIL_APP_PASSWORD", "")
     if not (sender and app_pw):
         return "Email notifications not configured yet (EMAIL_SENDER / EMAIL_APP_PASSWORD missing in secrets)."
@@ -339,13 +349,20 @@ def try_send_email(row: dict, kind: str = "confirmed") -> str:
     )
     try:
         msg = MIMEText(body)
-        msg["Subject"], msg["From"], msg["To"] = subject, sender, row["email"]
+        msg["Subject"], msg["From"], msg["To"] = subject, sender, to_addr
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as srv:
             srv.login(sender, app_pw)
-            srv.send_message(msg)
-        return f"Confirmation email sent to {row['email']}."
-    except Exception as e:  # noqa: BLE001 - show friendly message, never crash a booking
-        return f"Booking saved, but the email could not be sent ({type(e).__name__})."
+            srv.sendmail(sender, [to_addr], msg.as_string())
+        return f"Confirmation email sent to {to_addr}."
+    except smtplib.SMTPRecipientsRefused as e:
+        detail = "; ".join(f"{r}: {c} {m.decode(errors='replace') if isinstance(m, bytes) else m}"
+                           for r, (c, m) in e.recipients.items())
+        return f"Booking saved, but Gmail refused the recipient - {detail}"
+    except smtplib.SMTPAuthenticationError:
+        return ("Booking saved, but the email login failed - check EMAIL_SENDER and "
+                "EMAIL_APP_PASSWORD in secrets (app password, not the normal password).")
+    except Exception as e:  # noqa: BLE001 - never crash a booking over email
+        return f"Booking saved, but the email could not be sent ({type(e).__name__}: {str(e)[:120]})."
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +632,9 @@ def validate_booking(df: pd.DataFrame, b: dict) -> list[str]:
         problems.append("Full name is required.")
     if not valid_mobile(b.get("mobile", "")):
         problems.append("A valid 10-digit Indian mobile number is required.")
+    if b.get("email", "").strip() and not valid_email(b["email"]):
+        problems.append("That email address doesn't look valid - please correct it "
+                        "or leave the field empty.")
     if not b.get("state", "").strip() or not b.get("city", "").strip():
         problems.append("State and city are required.")
     if not b.get("serial_number", "").strip():
